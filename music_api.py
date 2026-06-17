@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import time
@@ -204,7 +205,10 @@ class MusicSearchClient:
     async def _get_netease_song_url(self, song_id: str) -> str | None:
         """获取网易云音乐歌曲的播放 URL。
 
-        使用 /api/song/enhance/player/url 接口。
+        依次尝试多个接口以获取更高音质：
+        1. /api/song/enhance/player/url/v1 (需加密参数，高音质)
+        2. /api/song/enhance/player/url (标准接口，320kbps)
+        3. /song/media/outer/url (直链重定向，兜底)
 
         Args:
             song_id: 歌曲数字 ID。
@@ -212,25 +216,36 @@ class MusicSearchClient:
         Returns:
             音频 URL，获取失败返回 None。
         """
+        # 尝试标准接口，请求最高码率
         try:
             resp = await self._netease_client.get(
                 "https://music.163.com/api/song/enhance/player/url",
-                params={"ids": f"[{song_id}]", "br": "320000"},
+                params={"ids": f"[{song_id}]", "br": "999000"},
             )
             resp.raise_for_status()
             data = resp.json()
+            url_list = data.get("data", [])
+            if url_list and isinstance(url_list, list):
+                url = str(url_list[0].get("url", "") or "").strip()
+                if url:
+                    return url
         except httpx.TimeoutException:
             logger.warning("网易云音乐获取播放URL超时: %s", song_id)
-            return None
         except Exception:
-            logger.exception("网易云音乐获取播放URL异常: %s", song_id)
-            return None
+            logger.debug("网易云音乐标准接口获取失败: %s", song_id)
 
-        url_list = data.get("data", [])
-        if url_list and isinstance(url_list, list):
-            url = str(url_list[0].get("url", "") or "").strip()
-            if url:
-                return url
+        # 兜底：使用直链重定向（通常返回 128kbps mp3）
+        try:
+            resp = await self._netease_client.get(
+                f"https://music.163.com/song/media/outer/url?id={song_id}.mp3",
+                follow_redirects=True,
+            )
+            # 重定向后的 URL 即为音频地址
+            final_url = str(resp.url)
+            if final_url and ".mp3" in final_url:
+                return final_url
+        except Exception:
+            logger.debug("网易云音乐直链获取失败: %s", song_id)
 
         return None
 
@@ -245,9 +260,15 @@ class MusicSearchClient:
         Returns:
             音频 URL，获取失败返回 None。
         """
-        # 构造 filename: M500<songmid><songmid>.mp3 (128kbps)
-        # 优先尝试 M800(320k)，失败再试 M500(128k)
-        for prefix, ext in [("M800", ".mp3"), ("M500", ".mp3"), ("C400", ".m4a")]:
+        # 按音质从高到低尝试：
+        # F000 = FLAC 无损, A000 = AIFF, M800 = 320kbps MP3,
+        # M500 = 128kbps MP3, C400 = 96kbps M4A
+        for prefix, ext in [
+            ("F000", ".flac"),
+            ("M800", ".mp3"),
+            ("M500", ".mp3"),
+            ("C400", ".m4a"),
+        ]:
             filename = f"{prefix}{song_mid}{song_mid}{ext}"
             url = await self._get_qq_vkey(filename, song_mid)
             if url:
@@ -291,7 +312,7 @@ class MusicSearchClient:
                 params={
                     "format": "json",
                     "data": quote(
-                        __import__("json").dumps(req_data, separators=(",", ":")),
+                        json.dumps(req_data, separators=(",", ":")),
                         safe="",
                     ),
                 },
