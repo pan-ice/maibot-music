@@ -8,3 +8,11 @@ auto_parse_url = true
 auto_parse_card = true
 search_limit = 5
 send_mode = "voice"
+
+[netease]
+MUSIC_U = ""        # 登录凭证，用于获取高音质
+csrf_token = ""     # __csrf CSRF 令牌，与 MUSIC_U 配对
+
+[qq]
+uin = ""                # QQ 号
+qqmusic_key = ""        # 鉴权令牌，VIP 用户用于获取高音质

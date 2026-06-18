@@ -46,11 +46,47 @@ class MusicConfig(PluginConfigBase):
     )
 
 
+class NeteaseConfig(PluginConfigBase):
+    """网易云音乐配置。"""
+
+    __ui_label__ = "网易云音乐"
+    __ui_icon__ = "cloud"
+    __ui_order__ = 2
+
+    MUSIC_U: str = Field(
+        default="",
+        description="MUSIC_U — 登录凭证，用于获取高音质",
+    )
+    csrf_token: str = Field(
+        default="",
+        description="__csrf — CSRF 令牌，与 MUSIC_U 配对",
+    )
+
+
+class QQMusicConfig(PluginConfigBase):
+    """QQ音乐配置。"""
+
+    __ui_label__ = "QQ音乐"
+    __ui_icon__ = "headphones"
+    __ui_order__ = 3
+
+    uin: str = Field(
+        default="",
+        description="uin — QQ 号",
+    )
+    qqmusic_key: str = Field(
+        default="",
+        description="qqmusic_key — 鉴权令牌，VIP 用户用于获取高音质",
+    )
+
+
 class MusicPluginConfig(PluginConfigBase):
     """音乐插件配置。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     music: MusicConfig = Field(default_factory=MusicConfig)
+    netease: NeteaseConfig = Field(default_factory=NeteaseConfig)
+    qq: QQMusicConfig = Field(default_factory=QQMusicConfig)
 
 
 # ===== 待选状态 =====
@@ -74,7 +110,22 @@ class MusicPlugin(MaiBotPlugin):
     def _get_api(self) -> MusicSearchClient:
         """获取或创建 API 客户端。"""
         if self._api is None:
-            self._api = MusicSearchClient()
+            netease_cookie: dict[str, str] = {}
+            if self.config.netease.MUSIC_U:
+                netease_cookie["MUSIC_U"] = self.config.netease.MUSIC_U
+            if self.config.netease.csrf_token:
+                netease_cookie["__csrf"] = self.config.netease.csrf_token
+
+            qq_cookie: dict[str, str] = {}
+            if self.config.qq.uin:
+                qq_cookie["uin"] = self.config.qq.uin
+            if self.config.qq.qqmusic_key:
+                qq_cookie["qqmusic_key"] = self.config.qq.qqmusic_key
+
+            self._api = MusicSearchClient(
+                netease_cookie=netease_cookie,
+                qq_cookie=qq_cookie,
+            )
         return self._api
 
     def _resolve_platform(self, platform: str = "") -> str:
@@ -147,7 +198,7 @@ class MusicPlugin(MaiBotPlugin):
         if mode in ("voice", "both"):
             api = self._get_api()
             try:
-                audio_url = await api.get_song_url(song.song_id, song.platform)
+                audio_url = await api.get_song_url(song.song_id, song.platform, song.media_id)
             except Exception:
                 self.ctx.logger.exception("获取音频URL异常: %s", song.song_id)
                 return
@@ -187,7 +238,11 @@ class MusicPlugin(MaiBotPlugin):
         self.ctx.logger.info("音乐插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
-        """配置热重载。"""
+        """配置热重载 — 重置 API 客户端以应用新 Cookie。"""
+        if self._api is not None:
+            await self._api.close()
+            self._api = None
+        self.ctx.logger.info("音乐插件配置已更新，API 客户端已重置")
 
     # ===== Tool 组件 =====
 

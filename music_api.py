@@ -2,25 +2,35 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
-import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
 
 import httpx
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 logger = logging.getLogger("maibot-music.api")
 
 # 网络请求超时（秒）
 _REQUEST_TIMEOUT = 10
 
-# 网易云音乐请求头
+# 网易云音乐 eapi 加密密钥（16 字节 AES-128-ECB）
+_EAPI_KEY = b"e82ckenh8dichen8"
+
+# 网易云音乐请求头 — Web 端
 _NETEASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://music.163.com/",
+}
+
+# 网易云音乐请求头 — 移动端 eapi
+_EAPI_HEADERS = {
+    "User-Agent": "NeteaseMusic/9.1.65.240916182646(9001065);Dalvik/2.1.0 (Linux; U; Android 14)",
+    "Referer": "/api/song/enhance/player/url",
 }
 
 # QQ音乐请求头
@@ -39,6 +49,7 @@ class SongInfo:
     artists: str  # 歌手名（逗号分隔）
     album: str  # 专辑名
     platform: str  # "163" 或 "qq"
+    media_id: str = ""  # QQ音乐的 strMediaMid（用于构造播放URL的filename）
 
     def display(self) -> str:
         """返回可读的歌曲描述。"""
@@ -50,17 +61,83 @@ class SongInfo:
         return " ".join(parts)
 
 
-class MusicSearchClient:
-    """音乐搜索客户端，支持网易云和QQ音乐。"""
+# ===== eapi 加密工具 =====
 
-    def __init__(self) -> None:
+
+def _aes_ecb_encrypt(key: bytes, data: bytes) -> bytes:
+    """AES-128-ECB 加密，PKCS7 填充。"""
+    cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
+    encryptor = cipher.encryptor()
+    pad_len = 16 - (len(data) % 16)
+    padded = data + bytes([pad_len] * pad_len)
+    return encryptor.update(padded) + encryptor.finalize()
+
+
+def _eapi_encrypt(url: str, params: dict[str, Any]) -> tuple[str, str]:
+    """网易云音乐 eapi 加密。
+
+    Args:
+        url: API 路径，如 /api/song/enhance/player/url
+        params: 请求参数字典。
+
+    Returns:
+        (enc_text, enc_sec_key) — 加密后的请求参数。
+    """
+    data_text = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
+
+    # 签名：nobody{url}use{data}md5forencrypt → MD5 → 拼接 → 加密
+    sign_src = f"nobody{url}use{data_text}md5forencrypt"
+    md5_hash = hashlib.md5(sign_src.encode()).hexdigest()
+    sign_text = f"{url}-36cd479b6b5-{data_text}-36cd479b6b5-{md5_hash}"
+
+    enc_text = _aes_ecb_encrypt(_EAPI_KEY, sign_text.encode()).hex().upper()
+    return enc_text
+
+
+class MusicSearchClient:
+    """音乐搜索客户端，支持网易云和QQ音乐。
+
+    Args:
+        netease_cookie: 网易云音乐 Cookie，形如 {"MUSIC_U": "...", "__csrf": "..."}。
+        qq_cookie: QQ音乐 Cookie，形如 {"uin": "...", "qqmusic_key": "..."}。
+    """
+
+    def __init__(
+        self,
+        netease_cookie: dict[str, str] | None = None,
+        qq_cookie: dict[str, str] | None = None,
+    ) -> None:
+        self._netease_cookie = netease_cookie or {}
+        self._qq_cookie = qq_cookie or {}
+
+        # 将用户提供的 Cookie 注入到 HTTP 客户端
+        netease_cookies = {}
+        if self._netease_cookie.get("MUSIC_U"):
+            netease_cookies["MUSIC_U"] = self._netease_cookie["MUSIC_U"]
+        if self._netease_cookie.get("__csrf"):
+            netease_cookies["__csrf"] = self._netease_cookie["__csrf"]
+
+        qq_cookies = {}
+        if self._qq_cookie.get("uin"):
+            qq_cookies["uin"] = self._qq_cookie["uin"]
+        if self._qq_cookie.get("qqmusic_key"):
+            qq_cookies["qqmusic_key"] = self._qq_cookie["qqmusic_key"]
+
         self._netease_client = httpx.AsyncClient(
             headers=_NETEASE_HEADERS,
+            cookies=netease_cookies,
+            timeout=_REQUEST_TIMEOUT,
+            follow_redirects=True,
+        )
+        self._eapi_client = httpx.AsyncClient(
+            headers=_EAPI_HEADERS,
+            cookies=netease_cookies,
             timeout=_REQUEST_TIMEOUT,
             follow_redirects=True,
         )
         self._qq_client = httpx.AsyncClient(
             headers=_QQ_HEADERS,
+            cookies=qq_cookies,
             timeout=_REQUEST_TIMEOUT,
             follow_redirects=True,
         )
@@ -68,6 +145,7 @@ class MusicSearchClient:
     async def close(self) -> None:
         """关闭 HTTP 客户端。"""
         await self._netease_client.aclose()
+        await self._eapi_client.aclose()
         await self._qq_client.aclose()
 
     async def search(self, query: str, platform: str, limit: int = 5) -> list[SongInfo]:
@@ -174,6 +252,8 @@ class MusicSearchClient:
             singers = song.get("singer", [])
             artists = ", ".join(s.get("name", "") for s in singers if s.get("name"))
             album = str(song.get("albumname", "") or song.get("album", {}).get("name", ""))
+            # strMediaMid 可能和 songmid 不同，用于构造播放URL
+            media_mid = str(song.get("strMediaMid", "") or song.get("media_mid", "") or song_mid)
             if song_mid and name:
                 results.append(
                     SongInfo(
@@ -182,32 +262,34 @@ class MusicSearchClient:
                         artists=artists,
                         album=album,
                         platform="qq",
+                        media_id=media_mid,
                     )
                 )
         return results
 
     # ===== 获取音频 URL =====
 
-    async def get_song_url(self, song_id: str, platform: str) -> str | None:
+    async def get_song_url(self, song_id: str, platform: str, media_id: str = "") -> str | None:
         """获取歌曲的可播放音频 URL。
 
         Args:
             song_id: 歌曲ID。
             platform: 音乐平台，"163" 或 "qq"。
+            media_id: QQ音乐的 strMediaMid（用于构造播放URL的filename）。
 
         Returns:
             音频 URL，获取失败返回 None。
         """
         if platform == "qq":
-            return await self._get_qq_song_url(song_id)
+            return await self._get_qq_song_url(song_id, media_id)
         return await self._get_netease_song_url(song_id)
 
     async def _get_netease_song_url(self, song_id: str) -> str | None:
         """获取网易云音乐歌曲的播放 URL。
 
-        依次尝试多个接口以获取更高音质：
-        1. /api/song/enhance/player/url/v1 (需加密参数，高音质)
-        2. /api/song/enhance/player/url (标准接口，320kbps)
+        依次尝试：
+        1. eapi /api/song/enhance/player/url (移动端加密接口，付费歌曲首选)
+        2. /api/song/enhance/player/url (标准 Web 接口，有登录态可获取高音质)
         3. /song/media/outer/url (直链重定向，兜底)
 
         Args:
@@ -216,60 +298,159 @@ class MusicSearchClient:
         Returns:
             音频 URL，获取失败返回 None。
         """
-        # 尝试标准接口，请求最高码率
+        # 1. eapi 加密接口 — 对免费和付费歌曲都更友好
+        url = await self._get_netease_eapi_url(song_id)
+        if url:
+            return url
+
+        # 2. 标准 Web 接口
+        url = await self._get_netease_web_url(song_id)
+        if url:
+            return url
+
+        # 3. 直链重定向兜底
+        url = await self._get_netease_direct_url(song_id)
+        if url:
+            return url
+
+        return None
+
+    async def _get_netease_eapi_url(self, song_id: str) -> str | None:
+        """通过 eapi 加密接口获取网易云歌曲播放 URL。
+
+        eapi 是移动端接口，对付费/VIP 歌曲支持更好。
+        需要有 MUSIC_U 登录态。
+
+        Args:
+            song_id: 歌曲数字 ID。
+
+        Returns:
+            音频 URL，获取失败返回 None。
+        """
+        api_path = "/api/song/enhance/player/url"
+        csrf_token = self._netease_cookie.get("__csrf", "")
+
+        params: dict[str, Any] = {
+            "ids": f"[{song_id}]",
+            "br": 999000,
+            "csrf_token": csrf_token,
+        }
+
         try:
-            resp = await self._netease_client.get(
-                "https://music.163.com/api/song/enhance/player/url",
-                params={"ids": f"[{song_id}]", "br": "999000"},
+            enc_params = _eapi_encrypt(api_path, params)
+            resp = await self._eapi_client.post(
+                f"https://interface.music.163.com/eapi{api_path}",
+                data={"params": enc_params},
             )
             resp.raise_for_status()
             data = resp.json()
+            logger.debug("网易云eapi响应: song_id=%s code=%s", song_id, data.get("code"))
             url_list = data.get("data", [])
             if url_list and isinstance(url_list, list):
                 url = str(url_list[0].get("url", "") or "").strip()
                 if url:
                     return url
+                logger.debug(
+                    "网易云eapi返回空URL: song_id=%s code=%s",
+                    song_id,
+                    url_list[0].get("code"),
+                )
+        except httpx.TimeoutException:
+            logger.warning("网易云eapi获取播放URL超时: %s", song_id)
+        except Exception:
+            logger.warning("网易云eapi获取失败: %s", song_id)
+
+        return None
+
+    async def _get_netease_web_url(self, song_id: str) -> str | None:
+        """通过标准 Web 接口获取网易云歌曲播放 URL。
+
+        Args:
+            song_id: 歌曲数字 ID。
+
+        Returns:
+            音频 URL，获取失败返回 None。
+        """
+        params: dict[str, str] = {"ids": f"[{song_id}]", "br": "999000"}
+        csrf_token = self._netease_cookie.get("__csrf", "")
+        if csrf_token:
+            params["csrf_token"] = csrf_token
+
+        try:
+            resp = await self._netease_client.get(
+                "https://music.163.com/api/song/enhance/player/url",
+                params=params,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            logger.debug("网易云标准接口响应: song_id=%s code=%s", song_id, data.get("code"))
+            url_list = data.get("data", [])
+            if url_list and isinstance(url_list, list):
+                url = str(url_list[0].get("url", "") or "").strip()
+                if url:
+                    return url
+                logger.debug(
+                    "网易云标准接口返回空URL: song_id=%s code=%s",
+                    song_id,
+                    url_list[0].get("code"),
+                )
         except httpx.TimeoutException:
             logger.warning("网易云音乐获取播放URL超时: %s", song_id)
         except Exception:
-            logger.debug("网易云音乐标准接口获取失败: %s", song_id)
+            logger.warning("网易云音乐标准接口获取失败: %s", song_id)
 
-        # 兜底：使用直链重定向（通常返回 128kbps mp3）
+        return None
+
+    async def _get_netease_direct_url(self, song_id: str) -> str | None:
+        """通过直链重定向获取网易云歌曲播放 URL。
+
+        Args:
+            song_id: 歌曲数字 ID。
+
+        Returns:
+            音频 URL，获取失败返回 None。
+        """
         try:
             resp = await self._netease_client.get(
                 f"https://music.163.com/song/media/outer/url?id={song_id}.mp3",
                 follow_redirects=True,
             )
-            # 重定向后的 URL 即为音频地址
             final_url = str(resp.url)
-            if final_url and ".mp3" in final_url:
+            logger.debug("网易云直链重定向: song_id=%s final_url=%s", song_id, final_url)
+            if final_url and any(ext in final_url for ext in (".mp3", ".flac", ".m4a")):
                 return final_url
         except Exception:
             logger.debug("网易云音乐直链获取失败: %s", song_id)
 
         return None
 
-    async def _get_qq_song_url(self, song_mid: str) -> str | None:
+    async def _get_qq_song_url(self, song_mid: str, media_mid: str = "") -> str | None:
         """获取QQ音乐歌曲的播放 URL。
 
         使用 vkey.GetVkeyServer 接口。
 
         Args:
             song_mid: 歌曲 mid。
+            media_mid: 歌曲 strMediaMid，用于构造 filename。
+                许多歌曲的 media_mid 与 song_mid 不同，
+                使用错误的 mid 会导致有版权的歌也无法获取播放链接。
 
         Returns:
             音频 URL，获取失败返回 None。
         """
+        if not media_mid:
+            media_mid = song_mid
         # 按音质从高到低尝试：
         # F000 = FLAC 无损, A000 = AIFF, M800 = 320kbps MP3,
         # M500 = 128kbps MP3, C400 = 96kbps M4A
+        # filename 格式: {prefix}{songmid}{mediaMid}{ext}
         for prefix, ext in [
             ("F000", ".flac"),
             ("M800", ".mp3"),
             ("M500", ".mp3"),
             ("C400", ".m4a"),
         ]:
-            filename = f"{prefix}{song_mid}{song_mid}{ext}"
+            filename = f"{prefix}{song_mid}{media_mid}{ext}"
             url = await self._get_qq_vkey(filename, song_mid)
             if url:
                 return url
@@ -286,7 +467,12 @@ class MusicSearchClient:
         Returns:
             音频 URL，获取失败返回 None。
         """
-        guid = str(int(random.random() * 2147483647 * time.time()) % 10000000000)
+        guid = str(random.randint(1000000000, 9999999999))
+
+        # 从配置获取登录态
+        uin = self._qq_cookie.get("uin", "0")
+        qqmusic_key = self._qq_cookie.get("qqmusic_key", "")
+        loginflag = 1 if uin != "0" else 0
 
         req_data = {
             "req_0": {
@@ -297,25 +483,25 @@ class MusicSearchClient:
                     "guid": guid,
                     "songmid": [song_mid],
                     "songtype": [0],
-                    "uin": "0",
-                    "loginflag": 1,
+                    "uin": uin,
+                    "loginflag": loginflag,
                     "platform": "20",
                 },
             },
-            "loginUin": "0",
-            "comm": {"uin": "0", "format": "json", "ct": 24, "cv": 0},
+            "loginUin": uin,
+            "comm": {
+                "uin": uin,
+                "format": "json",
+                "ct": 19,
+                "cv": 0,
+                "authst": qqmusic_key,
+            },
         }
 
         try:
-            resp = await self._qq_client.get(
+            resp = await self._qq_client.post(
                 "https://u.y.qq.com/cgi-bin/musicu.fcg",
-                params={
-                    "format": "json",
-                    "data": quote(
-                        json.dumps(req_data, separators=(",", ":")),
-                        safe="",
-                    ),
-                },
+                json=req_data,
             )
             resp.raise_for_status()
             data = resp.json()

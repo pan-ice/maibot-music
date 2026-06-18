@@ -28,6 +28,11 @@
       "type": "python_package",
       "name": "httpx",
       "version_spec": ">=0.27.0"
+    },
+    {
+      "type": "python_package",
+      "name": "cryptography",
+      "version_spec": ">=42.0.0"
     }
   ],
   "capabilities": [
