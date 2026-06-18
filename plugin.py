@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
-from maibot_sdk import Command, EventHandler, Field, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import EventType, ToolParameterInfo, ToolParamType
+from maibot_sdk import Command, EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import EventType, HookMode, ToolParameterInfo, ToolParamType
 
 from .music_api import MusicSearchClient, SongInfo
-from .url_parser import extract_urls, parse_music_url
+from .url_parser import extract_urls, parse_music_card_text, parse_music_url
 
 
 # ===== 配置模型 =====
@@ -80,6 +81,23 @@ class QQMusicConfig(PluginConfigBase):
     )
 
 
+class NapCatConfig(PluginConfigBase):
+    """NapCat HTTP API 配置（用于解析音乐卡片原始数据）。"""
+
+    __ui_label__ = "NapCat"
+    __ui_icon__ = "server"
+    __ui_order__ = 4
+
+    http_url: str = Field(
+        default="http://127.0.0.1:3000",
+        description="NapCat HTTP API 地址（如 http://127.0.0.1:3000）",
+    )
+    http_token: str = Field(
+        default="",
+        description="NapCat HTTP API 访问令牌（留空则不鉴权）",
+    )
+
+
 class MusicPluginConfig(PluginConfigBase):
     """音乐插件配置。"""
 
@@ -87,6 +105,7 @@ class MusicPluginConfig(PluginConfigBase):
     music: MusicConfig = Field(default_factory=MusicConfig)
     netease: NeteaseConfig = Field(default_factory=NeteaseConfig)
     qq: QQMusicConfig = Field(default_factory=QQMusicConfig)
+    napcat: NapCatConfig = Field(default_factory=NapCatConfig)
 
 
 # ===== 待选状态 =====
@@ -405,37 +424,220 @@ class MusicPlugin(MaiBotPlugin):
 
     # ===== EventHandler 组件 =====
 
-    @EventHandler(
-        "music_url_parser",
-        description="解析音乐链接，发送音乐卡片和语音",
-        event_type=EventType.ON_MESSAGE,
-    )
-    async def handle_music_url_parse(
+    async def _resolve_music_card_from_raw(
         self,
-        message: Any = None,
-        stream_id: str = "",
-        **kwargs: Any,
-    ) -> tuple[bool, bool, str | None, None, None]:
-        """解析消息中的音乐链接，发送音乐卡片和语音。"""
-        del kwargs
+        message: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        """通过 NapCat HTTP API 获取原始消息，从 json 段解析音乐卡片的 jumpUrl。
 
-        if not self.config.music.auto_parse_url or not message:
-            return True, True, None, None, None
+        适配器将音乐卡片转成纯文本后会丢失歌曲 ID 等结构化数据。
+        此方法直接调 NapCat 的 get_msg HTTP API 获取原始消息，
+        从 json 段中提取 jumpUrl，精确解析出 (platform, song_id)。
 
-        # 提取消息文本
+        Args:
+            message: MessageDict 对象。
+
+        Returns:
+            (platform, song_id) 元组，解析失败返回 None。
+        """
+        message_id = str(message.get("message_id", "")).strip()
+        if not message_id:
+            return None
+
+        base_url = self.config.napcat.http_url.strip().rstrip("/")
+        if not base_url:
+            return None
+
+        try:
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            token = self.config.napcat.http_token.strip()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{base_url}/get_msg",
+                    json={"message_id": int(message_id)},
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                raw_detail = resp.json()
+        except Exception:
+            self.ctx.logger.debug("调用 NapCat get_msg 失败: %s", message_id)
+            return None
+
+        # 从响应中提取 data
+        data = raw_detail.get("data") if isinstance(raw_detail, dict) else None
+        if not isinstance(data, dict):
+            return None
+
+        # 原始消息中的 message 段列表
+        raw_segments = data.get("message", [])
+        if not isinstance(raw_segments, list):
+            return None
+
+        for segment in raw_segments:
+            if not isinstance(segment, dict):
+                continue
+            if segment.get("type") != "json":
+                continue
+
+            segment_data = segment.get("data", {})
+            json_str = str(segment_data.get("data") or "").strip() if isinstance(segment_data, dict) else ""
+            if not json_str:
+                continue
+
+            try:
+                parsed = json.loads(json_str)
+            except Exception:
+                continue
+
+            if not isinstance(parsed, dict):
+                continue
+
+            app_name = str(parsed.get("app") or "").strip()
+            meta = parsed.get("meta", {})
+            if not isinstance(meta, dict):
+                continue
+
+            # 音乐卡片 — com.tencent.music.lua / com.tencent.structmsg
+            if app_name in {"com.tencent.music.lua", "com.tencent.structmsg"}:
+                # 优先 meta.music，其次 meta.news
+                music_meta = meta.get("music", {})
+                if not isinstance(music_meta, dict) or not music_meta:
+                    music_meta = meta.get("news", {})
+                if isinstance(music_meta, dict) and music_meta:
+                    jump_url = str(music_meta.get("jumpUrl") or "").strip()
+                    if jump_url:
+                        # 网易云短链需要先解析重定向
+                        if "163cn.tv" in jump_url:
+                            api = self._get_api()
+                            resolved_url = await api.resolve_short_url(jump_url)
+                            if resolved_url:
+                                jump_url = resolved_url
+                        result = parse_music_url(jump_url)
+                        if result:
+                            return result
+
+            # 音乐小程序 — com.tencent.miniapp_01
+            if app_name == "com.tencent.miniapp_01":
+                detail = meta.get("detail_1", {})
+                if isinstance(detail, dict):
+                    qqdocurl = str(detail.get("qqdocurl") or "").strip()
+                    miniapp_title = str(detail.get("title") or "").strip()
+                    if qqdocurl and miniapp_title in ("QQ音乐", "网易云音乐"):
+                        if "163cn.tv" in qqdocurl:
+                            api = self._get_api()
+                            resolved_url = await api.resolve_short_url(qqdocurl)
+                            if resolved_url:
+                                qqdocurl = resolved_url
+                        result = parse_music_url(qqdocurl)
+                        if result:
+                            return result
+
+        return None
+
+    @HookHandler(
+        "chat.receive.after_process",
+        name="music_url_parser",
+        description="解析音乐链接和音乐卡片，发送音乐卡片和语音",
+        mode=HookMode.BLOCKING,
+        order=0,
+    )
+    async def handle_music_url_parse(self, **kwargs: Any) -> dict[str, Any]:
+        """解析消息中的音乐链接和音乐分享卡片，发送音乐卡片和语音。
+
+        Returns:
+            dict: Hook 返回值。aborted=True 时阻止消息进入聊天流程。
+        """
+        message = kwargs.get("message")
+        if not message:
+            return {"action": "continue"}
+
+        # 提取消息文本和 stream_id
         text = ""
+        stream_id = ""
+        message_id = ""
+
         if isinstance(message, dict):
-            text = message.get("plain_text", "") or message.get("raw_message", "") or ""
+            text = (
+                message.get("processed_plain_text", "")
+                or message.get("plain_text", "")
+                or message.get("display_message", "")
+                or ""
+            )
+            stream_id = str(message.get("stream_id", "") or message.get("session_id", "") or "")
+            message_id = str(message.get("message_id", "") or "")
+            if not text:
+                raw_msg = message.get("raw_message", [])
+                if isinstance(raw_msg, list):
+                    text = " ".join(
+                        str(seg.get("data", "")) if isinstance(seg, dict) and seg.get("type") == "text" else ""
+                        for seg in raw_msg
+                    ).strip()
         else:
             text = str(message)
 
-        if not text:
-            return True, True, None, None, None
+        if not text or not stream_id:
+            return {"action": "continue"}
+
+        # ── 1. 音乐卡片解析 ──
+        if self.config.music.auto_parse_card:
+            card_info = parse_music_card_text(text)
+            if card_info and card_info.query:
+                # 优先通过 get_msg API 从原始消息中精确解析歌曲 ID
+                card_result = None
+                if isinstance(message, dict) and message_id:
+                    card_result = await self._resolve_music_card_from_raw(message)
+
+                if card_result:
+                    platform, song_id = card_result
+                    await self._send_song(
+                        SongInfo(
+                            song_id=song_id,
+                            name=card_info.song_name,
+                            artists=card_info.artist,
+                            album="",
+                            platform=platform,
+                        ),
+                        stream_id,
+                    )
+                    self.ctx.logger.info(
+                        "已解析音乐卡片(精确): %s → %s %s",
+                        card_info.query,
+                        platform,
+                        song_id,
+                    )
+                else:
+                    # 回退：用歌名+歌手搜索
+                    platform = card_info.platform or self._resolve_platform("")
+                    api = self._get_api()
+                    try:
+                        results = await api.search(card_info.query, platform, limit=1)
+                    except Exception:
+                        self.ctx.logger.exception("音乐卡片搜索异常: %s", card_info.query)
+                        results = []
+
+                    if results:
+                        await self._send_song(results[0], stream_id)
+                        self.ctx.logger.info(
+                            "已解析音乐卡片(搜索): %s → %s",
+                            card_info.query,
+                            results[0].display(),
+                        )
+                    else:
+                        self.ctx.logger.info("音乐卡片搜索无结果: %s", card_info.query)
+
+                return {"action": "abort"}
+
+        # ── 2. URL 解析 ──
+        if not self.config.music.auto_parse_url:
+            return {"action": "continue"}
 
         # 查找文本中的 URL
         urls = extract_urls(text)
         if not urls:
-            return True, True, None, None, None
+            return {"action": "continue"}
 
         # 尝试解析每个 URL
         for url in urls:
@@ -483,10 +685,11 @@ class MusicPlugin(MaiBotPlugin):
                 except Exception:
                     self.ctx.logger.exception("发送语音音频失败: %s %s", platform, song_id)
 
-            # 只处理第一个匹配的音乐链接
-            break
+            # 只处理第一个匹配的音乐链接，拦截消息
+            return {"action": "abort"}
 
-        return True, True, None, None, None
+        # 未匹配到任何音乐链接/卡片，不拦截
+        return {"action": "continue"}
 
 
 def create_plugin() -> MusicPlugin:
