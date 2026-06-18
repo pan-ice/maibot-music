@@ -16,3 +16,7 @@ csrf_token = "b69b44fc981011ac8424c703dcc91b9a"     # __csrf CSRF 令牌，与 M
 [qq]
 uin = ""                # QQ 号
 qqmusic_key = ""        # 鉴权令牌，VIP 用户用于获取高音质
+
+[napcat]
+http_url = "http://127.0.0.1:9999"
+http_token = ""

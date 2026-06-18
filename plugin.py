@@ -542,7 +542,7 @@ class MusicPlugin(MaiBotPlugin):
         name="music_url_parser",
         description="解析音乐链接和音乐卡片，发送音乐卡片和语音",
         mode=HookMode.BLOCKING,
-        order=0,
+        order="normal",
     )
     async def handle_music_url_parse(self, **kwargs: Any) -> dict[str, Any]:
         """解析消息中的音乐链接和音乐分享卡片，发送音乐卡片和语音。
