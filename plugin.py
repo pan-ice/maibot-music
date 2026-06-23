@@ -186,8 +186,20 @@ class MusicPlugin(MaiBotPlugin):
             stream_id: 目标消息流 ID。
         """
         api = self._get_api()
+
+        # QQ 音乐专辑曲目的 songmid 和 strMediaMid 通常不同，
+        # 如果 media_id 为空则通过详情接口补查，避免构造错误的播放 filename
+        media_id = song.media_id
+        if song.platform == "qq" and not media_id:
+            try:
+                detail = await api.get_qq_song_detail(song.song_id)
+                if detail:
+                    media_id = detail.media_id
+            except Exception:
+                self.ctx.logger.debug("QQ音乐详情查询失败: %s", song.song_id)
+
         try:
-            audio_url = await api.get_song_url(song.song_id, song.platform, song.media_id)
+            audio_url = await api.get_song_url(song.song_id, song.platform, media_id)
         except Exception:
             self.ctx.logger.exception("获取音频URL异常: %s", song.song_id)
             return
@@ -637,10 +649,22 @@ class MusicPlugin(MaiBotPlugin):
                 else:
                     continue
 
+            # QQ 音乐需要 strMediaMid 构造正确的播放 filename
+            # URL 只能解析出 song_mid，通过详情接口补查 media_id
+            media_id = ""
+            if platform == "qq":
+                api = self._get_api()
+                try:
+                    detail = await api.get_qq_song_detail(song_id)
+                    if detail:
+                        media_id = detail.media_id
+                except Exception:
+                    self.ctx.logger.debug("QQ音乐详情查询失败: %s", song_id)
+
             # 发送语音音频
             api = self._get_api()
             try:
-                audio_url = await api.get_song_url(song_id, platform)
+                audio_url = await api.get_song_url(song_id, platform, media_id)
                 if audio_url:
                     await self.ctx.send.custom(
                         "voiceurl",
