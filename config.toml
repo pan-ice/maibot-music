@@ -7,7 +7,6 @@ default_platform = "163"
 auto_parse_url = true
 auto_parse_card = true
 search_limit = 5
-send_mode = "voice"
 
 [netease]
 MUSIC_U = ""        # 登录凭证，用于获取高音质
@@ -18,5 +17,5 @@ uin = ""                # QQ 号
 qqmusic_key = ""        # 鉴权令牌，VIP 用户用于获取高音质
 
 [napcat]
-http_url = "http://127.0.0.1:9999"
+http_url = "http://127.0.0.1:3000"
 http_token = ""

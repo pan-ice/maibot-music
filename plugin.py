@@ -1,4 +1,4 @@
-"""音乐插件 — 搜索点歌、解析音乐链接，发送音乐卡片和/或语音音频。"""
+"""音乐插件 — 搜索点歌、解析音乐链接，发送语音音频。"""
 
 from __future__ import annotations
 
@@ -41,10 +41,6 @@ class MusicConfig(PluginConfigBase):
     auto_parse_url: bool = Field(default=True, description="是否自动解析音乐链接")
     auto_parse_card: bool = Field(default=True, description="是否自动解析音乐卡片")
     search_limit: int = Field(default=5, description="搜索结果数量")
-    send_mode: str = Field(
-        default="card",
-        description="发送方式: card(仅音乐卡片)、voice(仅语音音频)、both(两者都发)",
-    )
 
 
 class NeteaseConfig(PluginConfigBase):
@@ -118,7 +114,7 @@ _pending_choices: dict[str, tuple[list[SongInfo], str]] = {}
 
 
 class MusicPlugin(MaiBotPlugin):
-    """音乐插件 — 搜索点歌、解析音乐链接，发送音乐卡片和/或语音音频。"""
+    """音乐插件 — 搜索点歌、解析音乐链接，发送语音音频。"""
 
     config_model = MusicPluginConfig
 
@@ -166,17 +162,6 @@ class MusicPlugin(MaiBotPlugin):
         default = self.config.music.default_platform.strip().lower()
         return default if default in ("163", "qq") else "163"
 
-    def _resolve_send_mode(self) -> str:
-        """解析发送模式配置。
-
-        Returns:
-            "card"、"voice" 或 "both"。
-        """
-        mode = self.config.music.send_mode.strip().lower()
-        if mode in ("card", "voice", "both"):
-            return mode
-        return "card"
-
     def _format_results(self, results: list[SongInfo]) -> str:
         """将搜索结果格式化为供用户选择的文本。
 
@@ -194,53 +179,36 @@ class MusicPlugin(MaiBotPlugin):
         return "\n".join(lines)
 
     async def _send_song(self, song: SongInfo, stream_id: str) -> None:
-        """根据配置的发送模式发送歌曲。
+        """发送歌曲语音音频。
 
         Args:
             song: SongInfo 对象。
             stream_id: 目标消息流 ID。
         """
-        mode = self._resolve_send_mode()
+        api = self._get_api()
+        try:
+            audio_url = await api.get_song_url(song.song_id, song.platform, song.media_id)
+        except Exception:
+            self.ctx.logger.exception("获取音频URL异常: %s", song.song_id)
+            return
 
-        # 发送音乐卡片
-        if mode in ("card", "both"):
-            try:
-                await self.ctx.send.custom(
-                    "music",
-                    {"type": song.platform, "id": song.song_id},
-                    stream_id,
-                )
-            except Exception:
-                self.ctx.logger.exception("发送音乐卡片失败: %s", song.song_id)
+        if not audio_url:
+            self.ctx.logger.info("未获取到音频URL: %s %s", song.platform, song.song_id)
+            await self.ctx.send.text(
+                f"找到「{song.display()}」但无法获取音频，可能因版权限制",
+                stream_id,
+            )
+            return
 
-        # 发送语音音频
-        if mode in ("voice", "both"):
-            api = self._get_api()
-            try:
-                audio_url = await api.get_song_url(song.song_id, song.platform, song.media_id)
-            except Exception:
-                self.ctx.logger.exception("获取音频URL异常: %s", song.song_id)
-                return
-
-            if not audio_url:
-                self.ctx.logger.info("未获取到音频URL: %s %s", song.platform, song.song_id)
-                if mode == "voice":
-                    await self.ctx.send.text(
-                        f"找到「{song.display()}」但无法获取音频，可能因版权限制",
-                        stream_id,
-                    )
-                return
-
-            try:
-                await self.ctx.send.custom(
-                    "voiceurl",
-                    {"url": audio_url},
-                    stream_id,
-                )
-            except Exception:
-                self.ctx.logger.exception("发送语音音频失败: %s", audio_url)
-                if mode == "voice":
-                    await self.ctx.send.text(song.display(), stream_id)
+        try:
+            await self.ctx.send.custom(
+                "voiceurl",
+                {"url": audio_url},
+                stream_id,
+            )
+        except Exception:
+            self.ctx.logger.exception("发送语音音频失败: %s", audio_url)
+            await self.ctx.send.text(song.display(), stream_id)
 
     # ===== 生命周期 =====
 
@@ -267,7 +235,7 @@ class MusicPlugin(MaiBotPlugin):
 
     @Tool(
         "search_and_play_music",
-        description="搜索歌曲并发送音乐卡片和语音。当用户想听歌、点歌、搜歌、找歌时使用此工具。",
+        description="搜索歌曲并发送语音音频。当用户想听歌、点歌、搜歌、找歌时使用此工具。",
         parameters=[
             ToolParameterInfo(
                 name="query",
@@ -540,7 +508,7 @@ class MusicPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.receive.after_process",
         name="music_url_parser",
-        description="解析音乐链接和音乐卡片，发送音乐卡片和语音",
+        description="解析音乐链接和音乐卡片，发送语音音频",
         mode=HookMode.BLOCKING,
         order="normal",
     )
@@ -608,8 +576,15 @@ class MusicPlugin(MaiBotPlugin):
                         platform,
                         song_id,
                     )
-                else:
-                    # 回退：用歌名+歌手搜索
+                    return {"action": "abort"}
+
+                # 精确解析失败，检查文本中是否有音乐 URL 可供步骤2处理
+                urls_in_text = extract_urls(text)
+                has_music_link = any(
+                    parse_music_url(u) is not None for u in urls_in_text
+                )
+                if not has_music_link:
+                    # 无音乐链接，用歌名+歌手搜索
                     platform = card_info.platform or self._resolve_platform("")
                     api = self._get_api()
                     try:
@@ -625,10 +600,12 @@ class MusicPlugin(MaiBotPlugin):
                             card_info.query,
                             results[0].display(),
                         )
+                        return {"action": "abort"}
                     else:
                         self.ctx.logger.info("音乐卡片搜索无结果: %s", card_info.query)
+                        return {"action": "continue"}
 
-                return {"action": "abort"}
+                # 有音乐链接，跳到步骤2让 URL 解析处理
 
         # ── 2. URL 解析 ──
         if not self.config.music.auto_parse_url:
@@ -647,43 +624,34 @@ class MusicPlugin(MaiBotPlugin):
 
             platform, song_id = result
 
-            # 处理网易云短链接（163cn.tv）
-            if "163cn.tv" in url:
+            # 处理网易云短链接（163cn.tv）— 需重定向解析
+            if platform == "163_short":
                 api = self._get_api()
                 resolved_url = await api.resolve_short_url(url)
                 if resolved_url:
                     short_result = parse_music_url(resolved_url)
-                    if short_result:
+                    if short_result and short_result[0] != "163_short":
                         platform, song_id = short_result
+                    else:
+                        continue
+                else:
+                    continue
 
-            # 根据配置发送
-            mode = self._resolve_send_mode()
-
-            # 发送音乐卡片
-            if mode in ("card", "both"):
-                try:
+            # 发送语音音频
+            api = self._get_api()
+            try:
+                audio_url = await api.get_song_url(song_id, platform)
+                if audio_url:
                     await self.ctx.send.custom(
-                        "music",
-                        {"type": platform, "id": song_id},
+                        "voiceurl",
+                        {"url": audio_url},
                         stream_id,
                     )
                     self.ctx.logger.info("已解析音乐链接: %s %s", platform, song_id)
-                except Exception:
-                    self.ctx.logger.exception("发送音乐卡片失败: %s %s", platform, song_id)
-
-            # 发送语音音频
-            if mode in ("voice", "both"):
-                api = self._get_api()
-                try:
-                    audio_url = await api.get_song_url(song_id, platform)
-                    if audio_url:
-                        await self.ctx.send.custom(
-                            "voiceurl",
-                            {"url": audio_url},
-                            stream_id,
-                        )
-                except Exception:
-                    self.ctx.logger.exception("发送语音音频失败: %s %s", platform, song_id)
+                else:
+                    self.ctx.logger.info("未获取到音频URL: %s %s", platform, song_id)
+            except Exception:
+                self.ctx.logger.exception("发送语音音频失败: %s %s", platform, song_id)
 
             # 只处理第一个匹配的音乐链接，拦截消息
             return {"action": "abort"}

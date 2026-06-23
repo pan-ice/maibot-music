@@ -14,6 +14,7 @@ def parse_music_url(text: str) -> tuple[str, str] | None:
         - 网易云: music.163.com/song?id=xxx
         - 网易云: music.163.com/m/song?id=xxx
         - 网易云: y.music.163.com/m/song?id=xxx（卡片 jumpUrl）
+        - 网易云: 163cn.tv/xxx（短链接，需重定向解析）
         - QQ音乐: y.qq.com/n/ryqq/songDetail/xxx
         - QQ音乐: y.qq.com/n/m/detail/song/xxx
         - QQ音乐: i.y.qq.com/v8/playsong.html?songmid=xxx（卡片 jumpUrl）
@@ -23,6 +24,7 @@ def parse_music_url(text: str) -> tuple[str, str] | None:
 
     Returns:
         (platform, song_id) 元组，未匹配返回 None。
+        对于网易云短链接，返回 ("163_short", 短链ID)，需要调用方做重定向解析。
     """
     if not text:
         return None
@@ -34,6 +36,14 @@ def parse_music_url(text: str) -> tuple[str, str] | None:
     )
     if netease_match:
         return ("163", netease_match.group(1))
+
+    # 网易云音乐短链接 — 163cn.tv/xxx（需重定向解析）
+    netease_short_match = re.search(
+        r"163cn\.tv/([A-Za-z0-9]+)",
+        text,
+    )
+    if netease_short_match:
+        return ("163_short", netease_short_match.group(1))
 
     # QQ音乐 — i.y.qq.com/v8/playsong.html?songmid=xxx（卡片 jumpUrl）
     # songmid 优先，其次 media_mid；二者都可能为空
@@ -110,6 +120,17 @@ _MINIAPP_MUSIC_PATTERN = re.compile(
     r"\[小程序\]\s*(QQ音乐|网易云音乐)\s*[：:]\s*(.+?)(?:\s*-\s*(.+))?$",
 )
 
+# 网易云音乐分享格式：分享xxx的单曲《歌名》: URL (来自@网易云音乐)
+# 歌名中可能含有》字符，需用贪婪匹配；URL 以空格/括号为边界
+_NETEASE_SHARE_PATTERN = re.compile(
+    r"分享.+?的单曲《(.+)》\s*[：:]\s*(https?://[^\s()]+)",
+)
+
+# QQ音乐分享格式：分享歌曲 《歌名》URL @QQ音乐
+_QQ_SHARE_PATTERN = re.compile(
+    r"分享歌曲\s*《(.+?)》\s*(https?://\S+)?\s*@?(QQ音乐|网易云音乐)?",
+)
+
 # 平台显示名 → 内部标识
 _PLATFORM_TAG_MAP: dict[str, str] = {
     "QQ音乐": "qq",
@@ -168,5 +189,19 @@ def parse_music_card_text(text: str) -> MusicCardInfo | None:
         platform = _PLATFORM_TAG_MAP.get(tag, "")
         query = f"{song_name} {artist}".strip() if artist else song_name
         return MusicCardInfo(platform=platform, query=query, song_name=song_name, artist=artist)
+
+    # 3. 尝试匹配"分享xxx的单曲《歌名》"格式（网易云分享）
+    match = _NETEASE_SHARE_PATTERN.search(text.strip())
+    if match:
+        song_name = match.group(1).strip()
+        return MusicCardInfo(platform="163", query=song_name, song_name=song_name, artist="")
+
+    # 4. 尝试匹配"分享歌曲"格式
+    match = _QQ_SHARE_PATTERN.search(text.strip())
+    if match:
+        song_name = match.group(1).strip()
+        tag = match.group(3) or ""
+        platform = _PLATFORM_TAG_MAP.get(tag, "")
+        return MusicCardInfo(platform=platform, query=song_name, song_name=song_name, artist="")
 
     return None
