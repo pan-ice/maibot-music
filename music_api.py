@@ -242,6 +242,9 @@ class MusicSearchClient:
     async def search_qq(self, query: str, limit: int = 5) -> list[SongInfo]:
         """搜索QQ音乐。
 
+        使用 musicu.fcg 的 SearchCgiService 接口，与 vkey 请求同域，
+        避免旧接口 client_search_cp 在部分网络环境下不可达。
+
         Args:
             query: 搜索关键词。
             limit: 返回结果数量上限。
@@ -249,10 +252,28 @@ class MusicSearchClient:
         Returns:
             歌曲信息列表。
         """
+        req_data = {
+            "req_1": {
+                "module": "music.search.SearchCgiService",
+                "method": "DoSearchForQQMusicDesktop",
+                "param": {
+                    "search_type": 0,
+                    "query": query,
+                    "page_num": 1,
+                    "num_per_page": limit,
+                },
+            },
+            "comm": {
+                "format": "json",
+                "ct": 19,
+                "cv": 0,
+            },
+        }
+
         try:
-            resp = await self._qq_client.get(
-                "https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
-                params={"w": query, "format": "json", "p": "1", "n": str(limit)},
+            resp = await self._qq_client.post(
+                "https://u.y.qq.com/cgi-bin/musicu.fcg",
+                json=req_data,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -266,19 +287,29 @@ class MusicSearchClient:
             logger.exception("QQ音乐搜索异常: %s", query)
             return []
 
-        song_list = data.get("data", {}).get("song", {}).get("list", [])
+        try:
+            body = data["req_1"]["data"]["body"]
+            song_list = body["song"]["list"]
+        except (KeyError, IndexError, TypeError):
+            logger.debug("QQ音乐搜索响应解析失败: %s", query)
+            return []
+
         if not song_list:
             return []
 
         results: list[SongInfo] = []
         for song in song_list:
-            song_mid = str(song.get("songmid", "") or song.get("mid", ""))
-            name = str(song.get("songname", "") or song.get("name", ""))
+            song_mid = str(song.get("mid", "") or song.get("songmid", ""))
+            name = str(song.get("name", "") or song.get("songname", ""))
             singers = song.get("singer", [])
             artists = ", ".join(s.get("name", "") for s in singers if s.get("name"))
-            album = str(song.get("albumname", "") or song.get("album", {}).get("name", ""))
-            # strMediaMid 可能和 songmid 不同，用于构造播放URL
-            media_mid = str(song.get("strMediaMid", "") or song.get("media_mid", "") or song_mid)
+            album = str(song.get("album", {}).get("name", "") or song.get("albumname", ""))
+            media_mid = str(
+                song.get("file", {}).get("media_mid", "")
+                or song.get("strMediaMid", "")
+                or song.get("media_mid", "")
+                or song_mid
+            )
             if song_mid and name:
                 results.append(
                     SongInfo(
