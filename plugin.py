@@ -229,10 +229,6 @@ class MusicPlugin(MaiBotPlugin):
 
         if not audio_url:
             self.ctx.logger.info("未获取到音频URL: %s %s", song.platform, song.song_id)
-            await self.ctx.send.text(
-                f"找到「{song.display()}」但无法获取音频，可能因版权限制",
-                stream_id,
-            )
             return False
 
         try:
@@ -243,7 +239,6 @@ class MusicPlugin(MaiBotPlugin):
             )
         except Exception:
             self.ctx.logger.exception("发送语音音频失败: %s", audio_url)
-            await self.ctx.send.text(song.display(), stream_id)
             return False
 
         return True
@@ -324,7 +319,11 @@ class MusicPlugin(MaiBotPlugin):
 
     @Tool(
         "search_and_play_music",
-        description="搜索歌曲并发送语音音频。当用户想听歌、点歌、搜歌、找歌时使用此工具。",
+        description=(
+            "搜索歌曲并发送语音音频。当用户想听歌、点歌、搜歌、找歌时使用此工具。"
+            "不要指定platform参数，让插件自动选择可用平台。"
+            "本工具已内置重试和换源逻辑，如果返回播放失败，不要重复调用，直接告诉用户结果即可。"
+        ),
         parameters=[
             ToolParameterInfo(
                 name="query",
@@ -332,29 +331,54 @@ class MusicPlugin(MaiBotPlugin):
                 description="歌曲名或关键词",
                 required=True,
             ),
-            ToolParameterInfo(
-                name="platform",
-                param_type=ToolParamType.STRING,
-                description="音乐平台: 163(网易云) 或 qq(QQ音乐)，不填使用默认平台",
-                required=False,
-            ),
         ],
     )
     async def handle_search_music(
         self,
         query: str = "",
-        platform: str = "",
         stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, str]:
-        """搜索歌曲并发送。"""
+        """搜索歌曲并直接播放。
+
+        与命令不同，Tool 调用时直接播放最佳匹配，不走"列出候选→用户选歌"流程。
+        默认平台播放失败时自动换另一个平台重试，多首候选逐个尝试。
+        """
         del kwargs
+        _TOOL_NAME = "search_and_play_music"
 
         if not query.strip():
-            return {"content": "请提供歌曲名或关键词"}
+            return {"name": _TOOL_NAME, "content": "请提供歌曲名或关键词"}
 
-        success, message = await self._do_search_and_send(query, platform, stream_id)
-        return {"content": message}
+        default = self._resolve_platform("")
+        alt_platform = "163" if default == "qq" else "qq"
+        ordered_platforms = [default, alt_platform]
+        api = self._get_api()
+
+        # 依次尝试：配置默认平台 → AI 指定平台 → 备选平台
+        for try_platform in ordered_platforms:
+            try:
+                results = await api.search(query, try_platform, limit=self.config.music.search_limit)
+            except Exception:
+                self.ctx.logger.exception("音乐搜索异常(%s): %s", try_platform, query)
+                continue
+
+            if not results:
+                continue
+
+            # 逐个尝试候选歌曲，直到成功播放一首
+            for song in results:
+                sent = await self._send_song(song, stream_id)
+                if sent:
+                    return {"name": _TOOL_NAME, "content": f"已播放: {song.display()}"}
+
+        return {
+            "name": _TOOL_NAME,
+            "content": (
+                f"已尝试在网易云音乐和QQ音乐搜索「{query}」，所有结果均无法获取音频，"
+                "可能因版权限制。请不要重复调用本工具，直接告知用户无法播放即可。"
+            ),
+        }
 
     # ===== Command 组件 =====
 
