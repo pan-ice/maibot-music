@@ -198,15 +198,18 @@ class MusicPlugin(MaiBotPlugin):
         lines.append(f"使用 {pfx}选歌 <序号> 选择歌曲，如 {pfx}选歌 1")
         return "\n".join(lines)
 
-    async def _send_song(self, song: SongInfo, stream_id: str) -> bool:
+    async def _send_song(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
         """发送歌曲语音音频。
 
         Args:
             song: SongInfo 对象。
             stream_id: 目标消息流 ID。
+            silent: 是否静默处理失败（不向用户发送提示文本）。
+                Tool 换源重试时传 True 避免刷屏；Command/Hook 路径保持默认 False，
+                失败时向用户发送提示。
 
         Returns:
-            是否成功发送音频（或提示消息）。获取音频 URL 失败返回 False。
+            是否成功发送音频。获取音频 URL 失败返回 False。
         """
         api = self._get_api()
 
@@ -229,6 +232,11 @@ class MusicPlugin(MaiBotPlugin):
 
         if not audio_url:
             self.ctx.logger.info("未获取到音频URL: %s %s", song.platform, song.song_id)
+            if not silent:
+                await self.ctx.send.text(
+                    f"找到「{song.display()}」但无法获取音频，可能因版权限制",
+                    stream_id,
+                )
             return False
 
         try:
@@ -239,6 +247,8 @@ class MusicPlugin(MaiBotPlugin):
             )
         except Exception:
             self.ctx.logger.exception("发送语音音频失败: %s", audio_url)
+            if not silent:
+                await self.ctx.send.text(song.display(), stream_id)
             return False
 
         return True
@@ -368,7 +378,7 @@ class MusicPlugin(MaiBotPlugin):
 
             # 逐个尝试候选歌曲，直到成功播放一首
             for song in results:
-                sent = await self._send_song(song, stream_id)
+                sent = await self._send_song(song, stream_id, silent=True)
                 if sent:
                     return {"name": _TOOL_NAME, "content": f"已播放: {song.display()}"}
 
