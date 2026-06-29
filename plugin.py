@@ -44,6 +44,10 @@ class MusicConfig(PluginConfigBase):
     auto_parse_url: bool = Field(default=True, description="是否自动解析音乐链接")
     auto_parse_card: bool = Field(default=True, description="是否自动解析音乐卡片")
     search_limit: int = Field(default=5, description="搜索结果数量")
+    auto_select_first: bool = Field(
+        default=False,
+        description="搜索到多首歌曲时是否跳过选歌阶段，直接发送第一首",
+    )
 
 
 class NeteaseConfig(PluginConfigBase):
@@ -301,6 +305,11 @@ class MusicPlugin(MaiBotPlugin):
 
         # 只有一首结果时直接发送
         if len(results) == 1:
+            sent = await self._send_song(results[0], stream_id)
+            return sent, f"已发送: {results[0].display()}" if sent else f"发送失败: {results[0].display()}"
+
+        # 多首结果时，根据配置决定是否跳过选歌阶段直接发送第一首
+        if self.config.music.auto_select_first:
             sent = await self._send_song(results[0], stream_id)
             return sent, f"已发送: {results[0].display()}" if sent else f"发送失败: {results[0].display()}"
 
