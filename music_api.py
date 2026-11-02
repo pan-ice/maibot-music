@@ -354,12 +354,16 @@ class MusicSearchClient:
             cookies=netease_cookies,
             timeout=_REQUEST_TIMEOUT,
             follow_redirects=True,
+            # 网易云对海外 IP 返回加密响应体或直接断连，必须直连，不吃系统代理
+            trust_env=False,
         )
         # QQ 音乐搜索、歌曲详情和播放资源请求都需要用户配置的登录态。
         self._qq_client = httpx.AsyncClient(
             headers=_QQ_HEADERS,
             cookies=qq_cookies,
             timeout=_REQUEST_TIMEOUT,
+            # 同上：QQ 音乐同样是国内站点，走代理会被判成海外 IP
+            trust_env=False,
         )
         # NapCat HTTP API 客户端（用于获取消息原始 JSON 解析音乐卡片）
         napcat_headers: dict[str, str] = {"Content-Type": "application/json"}

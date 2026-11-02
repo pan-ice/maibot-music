@@ -81,6 +81,8 @@ class MusicAudioCache:
         self._client = client or httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(download_timeout_seconds),
+            # 音频 CDN 在国内，永远直连，不吃 HTTP_PROXY/HTTPS_PROXY
+            trust_env=False,
         )
 
     async def initialize(self) -> None:
